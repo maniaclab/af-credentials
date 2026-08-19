@@ -10,11 +10,14 @@ Token").
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx2
+import jwt
 import pytest
-from conftest import AUDIENCE, ISSUER, mint_token, public_jwk
+from conftest import AUDIENCE, ISSUER, mint_token, public_jwk, rfc7638_thumbprint
 
 from af_credentials.verifier import BrokerClaims, BrokerTokenVerifier
 
@@ -161,6 +164,88 @@ class TestVerifyRejectsBadClaims:
         token = mint_token(second_rsa_keypair)
 
         assert await verifier.verify(token) is None
+
+
+class TestVerifyLogsRejectionReason:
+    """Every invalid-token path must leave a debug-level record of WHY (still returning None) -- uniform silent 401s were undiagnosable in production."""
+
+    def _verifier(
+        self, rsa_keypair: rsa.RSAPrivateKey
+    ) -> tuple[BrokerTokenVerifier, httpx2.AsyncClient]:
+        client, _calls = _jwks_client(
+            [{"keys": [public_jwk(rsa_keypair.public_key())]}]
+        )
+        verifier = BrokerTokenVerifier(
+            "https://broker.example/.well-known/jwks.json",
+            ISSUER,
+            AUDIENCE,
+            http_client=client,
+        )
+        return verifier, client
+
+    async def test_malformed_token_logs_header_parse_failure(
+        self, rsa_keypair: rsa.RSAPrivateKey, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger="af_credentials.verifier")
+        verifier, _client = self._verifier(rsa_keypair)
+
+        assert await verifier.verify("not-a-jwt-at-all") is None
+        assert "malformed" in caplog.text
+        # PyJWT's own message ("Not enough segments") must be included.
+        assert "segments" in caplog.text
+
+    async def test_missing_kid_logs_reason(
+        self, rsa_keypair: rsa.RSAPrivateKey, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger="af_credentials.verifier")
+        verifier, _client = self._verifier(rsa_keypair)
+        now = int(time.time())
+        # jwt.encode without an explicit header omits "kid" entirely.
+        token = jwt.encode(
+            {
+                "iss": ISSUER,
+                "sub": "af|12345",
+                "aud": AUDIENCE,
+                "exp": now + 600,
+                "iat": now,
+                "jti": "test-jti-0001",
+            },
+            rsa_keypair,
+            algorithm="RS256",
+        )
+
+        assert await verifier.verify(token) is None
+        assert "kid" in caplog.text
+        assert token not in caplog.text
+
+    async def test_unknown_kid_logs_kid_and_available_kids(
+        self,
+        rsa_keypair: rsa.RSAPrivateKey,
+        second_rsa_keypair: rsa.RSAPrivateKey,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger="af_credentials.verifier")
+        verifier, _client = self._verifier(rsa_keypair)
+        token = mint_token(second_rsa_keypair)
+
+        assert await verifier.verify(token) is None
+        # Both the token's kid and the kids the JWKS actually carries must
+        # appear, so a rotation mismatch is diagnosable from the log alone.
+        assert rfc7638_thumbprint(second_rsa_keypair.public_key()) in caplog.text
+        assert rfc7638_thumbprint(rsa_keypair.public_key()) in caplog.text
+        assert token not in caplog.text
+
+    async def test_decode_failure_logs_pyjwt_reason(
+        self, rsa_keypair: rsa.RSAPrivateKey, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG, logger="af_credentials.verifier")
+        verifier, _client = self._verifier(rsa_keypair)
+        token = mint_token(rsa_keypair, aud="some-other-backend")
+
+        assert await verifier.verify(token) is None
+        # PyJWT's InvalidAudienceError message pinpoints the failing check.
+        assert "audience" in caplog.text.lower()
+        assert token not in caplog.text
 
 
 class TestKeyRotation:
