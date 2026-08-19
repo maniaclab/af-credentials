@@ -29,16 +29,20 @@ def _redeem_response(
     status_code: int = 200,
     remaining_seconds: int = 3600,
     detail: str | None = None,
+    nickname: str | None = None,
 ) -> dict[str, object]:
     if status_code != 200:
         return {"detail": detail or "error"}
-    return {
+    body: dict[str, object] = {
         "pem": _PEM,
         "dn": _DN,
         "voms_attributes": ["/atlas/Role=NULL/Capability=NULL"],
         "expires_at": _EXPIRES_AT,
         "remaining_seconds": remaining_seconds,
     }
+    if nickname is not None:
+        body["nickname"] = nickname
+    return body
 
 
 def _client_for(
@@ -124,6 +128,23 @@ class TestProxyFileHappyPath:
         first.close()
         assert second.path.exists()
         second.close()
+
+
+class TestProxyHandleNickname:
+    async def test_nickname_surfaced_when_present(self) -> None:
+        http_client = _client_for(response_kwargs={"nickname": "gstark"})
+        client = ProxyClient(BROKER_URL, http_client=http_client)
+
+        with await client.proxy_file("bearer") as handle:
+            assert handle.nickname == "gstark"
+
+    async def test_nickname_defaults_to_none_when_absent(self) -> None:
+        """Skew safety: an older broker that doesn't send `nickname` yet must not break this client."""
+        http_client = _client_for()
+        client = ProxyClient(BROKER_URL, http_client=http_client)
+
+        with await client.proxy_file("bearer") as handle:
+            assert handle.nickname is None
 
 
 class TestPemBytes:

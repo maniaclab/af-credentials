@@ -10,7 +10,8 @@ response is::
       "dn": "<VOMS proxy subject DN>",
       "voms_attributes": ["<VOMS FQAN>", ...],
       "expires_at": "<ISO-8601 timestamp>",
-      "remaining_seconds": <int>
+      "remaining_seconds": <int>,
+      "nickname": "<CERN/VOMS nickname attribute, optional>"
     }
 
 Mirrors the broker's own credential-brokering shape (x509/VOMS proxies
@@ -89,6 +90,7 @@ class ProxyHandle:
     path: Path
     dn: str
     expires_at: datetime
+    nickname: str | None = None
     _closed: bool = field(default=False, init=False, repr=False)
 
     def close(self) -> None:
@@ -161,6 +163,7 @@ class ProxyClient:
             path=path,
             dn=data["dn"],
             expires_at=_parse_iso8601(data["expires_at"]),
+            nickname=data.get("nickname"),
         )
 
     async def pem_bytes(self, bearer: str) -> bytes:
