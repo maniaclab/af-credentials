@@ -17,6 +17,7 @@ rucio-mcp), verifying against the broker's own published JWKS
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,8 @@ from typing import Any
 import httpx2
 import jwt
 from jwt.algorithms import RSAAlgorithm
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -55,7 +58,10 @@ class BrokerTokenVerifier:
 
     ``verify()`` returns ``None`` for every way a token can be *invalid*
     (bad signature, wrong issuer/audience, expired, malformed, unknown
-    key) so callers can treat "not authenticated" uniformly. It does NOT
+    key) so callers can treat "not authenticated" uniformly; the specific
+    rejection reason is logged at DEBUG level (never the token itself --
+    it is a bearer credential) so operators can tell the paths apart
+    without changing the contract. It does NOT
     catch transport-level failures (a network error, or the JWKS endpoint
     itself returning a non-2xx status) -- those propagate as exceptions, so
     a caller can distinguish "the broker is unreachable" from "this token
@@ -99,14 +105,21 @@ class BrokerTokenVerifier:
         """
         try:
             header = jwt.get_unverified_header(token)
-        except jwt.InvalidTokenError:
+        except jwt.InvalidTokenError as exc:
+            logger.debug("Rejecting malformed token: cannot parse JWT header: %s", exc)
             return None
         kid = header.get("kid")
         if not isinstance(kid, str):
+            logger.debug("Rejecting token: header 'kid' is missing or not a string")
             return None
 
         key_data = await self._get_key(kid)
         if key_data is None:
+            logger.debug(
+                "Rejecting token: kid %r not in JWKS after refresh (available kids: %s)",
+                kid,
+                sorted(self._keys_by_kid),
+            )
             return None
 
         try:
@@ -119,7 +132,10 @@ class BrokerTokenVerifier:
                 audience=self._audience,
                 options={"verify_exp": True},
             )
-        except jwt.InvalidTokenError:
+        except jwt.InvalidTokenError as exc:
+            # PyJWT's message already distinguishes expired / bad signature /
+            # wrong issuer / audience mismatch -- pass it through verbatim.
+            logger.debug("Rejecting token: signature/claims validation failed: %s", exc)
             return None
 
         return BrokerClaims(
