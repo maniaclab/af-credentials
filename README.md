@@ -1,4 +1,4 @@
-# af-credentials v0.1.0
+# af-credentials v0.1.1
 
 [![Actions Status][actions-badge]][actions-link]
 [![Documentation Status][rtd-badge]][rtd-link]
