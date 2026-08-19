@@ -33,16 +33,14 @@ def _redeem_response(
 ) -> dict[str, object]:
     if status_code != 200:
         return {"detail": detail or "error"}
-    body: dict[str, object] = {
+    return {
         "pem": _PEM,
         "dn": _DN,
         "voms_attributes": ["/atlas/Role=NULL/Capability=NULL"],
         "expires_at": _EXPIRES_AT,
         "remaining_seconds": remaining_seconds,
+        "nickname": nickname,
     }
-    if nickname is not None:
-        body["nickname"] = nickname
-    return body
 
 
 def _client_for(
@@ -138,13 +136,32 @@ class TestProxyHandleNickname:
         with await client.proxy_file("bearer") as handle:
             assert handle.nickname == "gstark"
 
-    async def test_nickname_defaults_to_none_when_absent(self) -> None:
-        """Skew safety: an older broker that doesn't send `nickname` yet must not break this client."""
-        http_client = _client_for()
+    async def test_nickname_null_reflects_extraction_failure(self) -> None:
+        """`nickname: null` is a legitimate broker response -- VOMS attribute extraction can genuinely fail for a real user -- not a compat concern."""
+        http_client = _client_for(response_kwargs={"nickname": None})
         client = ProxyClient(BROKER_URL, http_client=http_client)
 
         with await client.proxy_file("bearer") as handle:
             assert handle.nickname is None
+
+    async def test_missing_nickname_key_raises(self) -> None:
+        """The broker always sends `nickname` now -- an absent key is a broker bug this client no longer tolerates."""
+        body = {
+            "pem": _PEM,
+            "dn": _DN,
+            "voms_attributes": ["/atlas/Role=NULL/Capability=NULL"],
+            "expires_at": _EXPIRES_AT,
+            "remaining_seconds": 3600,
+        }
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=body)
+
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        client = ProxyClient(BROKER_URL, http_client=http_client)
+
+        with pytest.raises(KeyError):
+            await client.proxy_file("bearer")
 
 
 class TestPemBytes:
