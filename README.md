@@ -163,8 +163,8 @@ try:
         run_subprocess(env={"KRB5CCNAME": str(handle.path)})
     # file is deleted here, on __exit__
 except ProxyNotAvailableError:
-    ...  # no ticket available for this caller right now, or the broker's
-    # own cached ticket is too close to expiry
+    ...  # no ticket available for this caller right now (no linked krb5-token
+    # identity, or the broker's own cached ticket is too close to expiry)
 except ProxyRedeemError as exc:
     ...  # the broker rejected/failed the call; exc.status_code, exc.detail
 ```
