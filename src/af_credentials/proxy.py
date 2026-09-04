@@ -22,13 +22,14 @@ talks HTTP to ``{broker_url}``.
 
 from __future__ import annotations
 
+import base64
 import os
 import stat
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx2
 
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
-_REDEEM_PATH = "/v1/credentials/x509/redeem"
+_REDEEM_PATH_TEMPLATE = "/v1/credentials/{kind}/redeem"
 
 
 class ProxyNotAvailableError(Exception):
@@ -111,28 +112,70 @@ class ProxyHandle:
         self.close()
 
 
-class ProxyClient:
-    """Redeems brokered x509/VOMS proxies from an AF MCP broker.
+@dataclass
+class TicketHandle:
+    """A materialized krb5 ccache on disk.
 
-    Materialized proxy files live under a private, 0700 directory created
-    lazily on first use (one per ``ProxyClient`` instance, reused across
-    calls); each file inside it is written 0600. *min_remaining* rejects a
-    freshly-redeemed proxy whose ``remaining_seconds`` is already below a
-    useful floor -- a caller who then retried "the credential I just got"
-    would just get the same near-expired proxy back (the broker caches it),
-    so this is reported as ``ProxyNotAvailableError`` rather than handed to
-    the caller as if it were usable.
+    A context manager: ``__exit__``/``close()`` deletes the underlying
+    file. Not cached by ``ProxyClient`` -- every ``ticket_file()`` call
+    returns its own handle over its own file (the broker itself caches the
+    ticket; this client does not cache handles across calls).
+    """
+
+    path: Path
+    principal: str
+    realm: str
+    expires_at: datetime
+    renew_until: datetime | None
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def close(self) -> None:
+        """Delete the underlying file. Safe to call more than once."""
+        if not self._closed:
+            self.path.unlink(missing_ok=True)
+            self._closed = True
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
+class ProxyClient:
+    """Redeems brokered x509/VOMS proxies or krb5 tickets from an AF MCP broker.
+
+    Materialized credential files live under a private, 0700 directory
+    created lazily on first use (one per ``ProxyClient`` instance, reused
+    across calls); each file inside it is written 0600. *min_remaining*
+    rejects a freshly-redeemed credential whose ``remaining_seconds`` is
+    already below a useful floor -- a caller who then retried "the
+    credential I just got" would just get the same near-expired credential
+    back (the broker caches it), so this is reported as
+    ``ProxyNotAvailableError`` rather than handed to the caller as if it
+    were usable.
     """
 
     def __init__(
         self,
         broker_url: str,
         *,
+        kind: Literal["x509", "krb5"] = "x509",
         timeout: float = 10.0,
         min_remaining: float = 60.0,
         http_client: httpx2.AsyncClient | None = None,
     ) -> None:
         """Construct a client against *broker_url* (e.g. ``https://mcp.af.uchicago.edu``).
+
+        *kind* selects which credential this client redeems: ``"x509"``
+        (the default, for ``proxy_file()``/``pem_bytes()``) or ``"krb5"``
+        (for ``ticket_file()``/``ccache_bytes()``). Calling a method for the
+        other kind raises ``ValueError``.
 
         *http_client*, when given, is used for the redeem call instead of a
         short-lived client created per call -- primarily a test seam
@@ -141,6 +184,7 @@ class ProxyClient:
         never closes an injected ``http_client``.
         """
         self._broker_url = broker_url.rstrip("/")
+        self._kind = kind
         self._timeout = timeout
         self._min_remaining = min_remaining
         self._http_client = http_client
@@ -148,6 +192,10 @@ class ProxyClient:
 
     async def proxy_file(self, bearer: str) -> ProxyHandle:
         """Redeem a proxy and materialize it as a private 0600 file, returning a handle whose ``close()`` deletes it."""
+        if self._kind != "x509":
+            raise ValueError(
+                f"proxy_file() requires kind='x509', but this client was constructed with kind={self._kind!r}"
+            )
         data = await self._redeem(bearer)
         directory = self._ensure_dir()
         fd, raw_path = tempfile.mkstemp(dir=directory, prefix="proxy-", suffix=".pem")
@@ -168,9 +216,54 @@ class ProxyClient:
 
     async def pem_bytes(self, bearer: str) -> bytes:
         """Redeem a proxy and return its PEM material in-memory, without writing a file."""
+        if self._kind != "x509":
+            raise ValueError(
+                f"pem_bytes() requires kind='x509', but this client was constructed with kind={self._kind!r}"
+            )
         data = await self._redeem(bearer)
         pem: str = data["pem"]
         return pem.encode()
+
+    async def ticket_file(self, bearer: str) -> TicketHandle:
+        """Redeem a krb5 ticket and materialize its ccache as a private 0600 file, returning a handle whose ``close()`` deletes it."""
+        if self._kind != "krb5":
+            raise ValueError(
+                f"ticket_file() requires kind='krb5', but this client was constructed with kind={self._kind!r}"
+            )
+        data = await self._redeem(bearer)
+        ccache = base64.b64decode(data["ccache_b64"])
+        directory = self._ensure_dir()
+        fd, raw_path = tempfile.mkstemp(
+            dir=directory, prefix="krb5cc-", suffix=".ccache"
+        )
+        path = Path(raw_path)
+        try:
+            with os.fdopen(fd, "wb") as ccache_file:
+                ccache_file.write(ccache)
+            path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        except OSError:
+            path.unlink(missing_ok=True)
+            raise
+        renew_until = data["renew_until"]
+        return TicketHandle(
+            path=path,
+            principal=data["principal"],
+            realm=data["realm"],
+            expires_at=_parse_iso8601(data["expires_at"]),
+            renew_until=_parse_iso8601(renew_until)
+            if renew_until is not None
+            else None,
+        )
+
+    async def ccache_bytes(self, bearer: str) -> bytes:
+        """Redeem a krb5 ticket and return its ccache material in-memory, without writing a file."""
+        if self._kind != "krb5":
+            raise ValueError(
+                f"ccache_bytes() requires kind='krb5', but this client was constructed with kind={self._kind!r}"
+            )
+        data = await self._redeem(bearer)
+        ccache_b64: str = data["ccache_b64"]
+        return base64.b64decode(ccache_b64)
 
     def _ensure_dir(self) -> Path:
         if self._dir is None:
@@ -181,7 +274,7 @@ class ProxyClient:
         return self._dir
 
     async def _redeem(self, bearer: str) -> dict[str, Any]:
-        url = f"{self._broker_url}{_REDEEM_PATH}"
+        url = f"{self._broker_url}{_REDEEM_PATH_TEMPLATE.format(kind=self._kind)}"
         headers = {"Authorization": f"Bearer {bearer}"}
         if self._http_client is not None:
             response = await self._http_client.post(

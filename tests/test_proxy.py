@@ -7,6 +7,7 @@ the exact request/response shape).
 
 from __future__ import annotations
 
+import base64
 import stat
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -22,6 +23,11 @@ _REDEEM_PATH = "/v1/credentials/x509/redeem"
 _PEM = "-----BEGIN CERTIFICATE-----\nfake-proxy-material\n-----END CERTIFICATE-----\n"
 _DN = "/DC=ch/DC=cern/OU=Organic Units/OU=Users/CN=kratsg/CN=123456/CN=Giordon Stark"
 _EXPIRES_AT = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+_CCACHE_BYTES = b"fake-ccache-binary-content"
+_PRINCIPAL = "gstark@CERN.CH"
+_REALM = "CERN.CH"
+_RENEW_UNTIL = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
 
 
 def _redeem_response(
@@ -57,6 +63,219 @@ def _client_for(
         return httpx2.Response(status_code, json=body)
 
     return httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+
+def _krb5_redeem_response(
+    *,
+    status_code: int = 200,
+    remaining_seconds: int = 3600,
+    detail: str | None = None,
+    renew_until: str | None = _RENEW_UNTIL,
+) -> dict[str, object]:
+    if status_code != 200:
+        return {"detail": detail or "error"}
+    return {
+        "ccache_b64": base64.b64encode(_CCACHE_BYTES).decode(),
+        "principal": _PRINCIPAL,
+        "realm": _REALM,
+        "expires_at": _EXPIRES_AT,
+        "remaining_seconds": remaining_seconds,
+        "renew_until": renew_until,
+    }
+
+
+def _krb5_client_for(
+    response_kwargs: dict[str, Any] | None = None,
+    *,
+    status_code: int = 200,
+) -> httpx2.AsyncClient:
+    body = _krb5_redeem_response(status_code=status_code, **(response_kwargs or {}))
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status_code, json=body)
+
+    return httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+
+class TestKindParameter:
+    async def test_default_kind_is_x509_and_posts_to_x509_path(self) -> None:
+        requests: list[httpx2.Request] = []
+        http_client = _client_for(captured_requests=requests)
+        client = ProxyClient(BROKER_URL, http_client=http_client)
+
+        with await client.proxy_file("bearer"):
+            pass
+
+        assert str(requests[0].url) == f"{BROKER_URL}/v1/credentials/x509/redeem"
+
+    async def test_explicit_krb5_kind_posts_to_krb5_path(self) -> None:
+        requests: list[httpx2.Request] = []
+        body = _krb5_redeem_response()
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            requests.append(request)
+            return httpx2.Response(200, json=body)
+
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        with await client.ticket_file("bearer"):
+            pass
+
+        assert str(requests[0].url) == f"{BROKER_URL}/v1/credentials/krb5/redeem"
+
+
+class TestKindGuards:
+    async def test_proxy_file_on_krb5_client_raises(self) -> None:
+        client = ProxyClient(BROKER_URL, kind="krb5")
+
+        with pytest.raises(ValueError, match="krb5"):
+            await client.proxy_file("bearer")
+
+    async def test_pem_bytes_on_krb5_client_raises(self) -> None:
+        client = ProxyClient(BROKER_URL, kind="krb5")
+
+        with pytest.raises(ValueError, match="krb5"):
+            await client.pem_bytes("bearer")
+
+    async def test_ticket_file_on_x509_client_raises(self) -> None:
+        client = ProxyClient(BROKER_URL)  # default kind="x509"
+
+        with pytest.raises(ValueError, match="x509"):
+            await client.ticket_file("bearer")
+
+    async def test_ccache_bytes_on_x509_client_raises(self) -> None:
+        client = ProxyClient(BROKER_URL)
+
+        with pytest.raises(ValueError, match="x509"):
+            await client.ccache_bytes("bearer")
+
+
+class TestTicketFileHappyPath:
+    async def test_sends_expected_request(self) -> None:
+        requests: list[httpx2.Request] = []
+        body = _krb5_redeem_response()
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            requests.append(request)
+            return httpx2.Response(200, json=body)
+
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        with await client.ticket_file("my-bearer-token"):
+            pass
+
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.method == "POST"
+        assert str(request.url) == f"{BROKER_URL}/v1/credentials/krb5/redeem"
+        assert request.headers["authorization"] == "Bearer my-bearer-token"
+        assert request.content == b"{}"
+
+    async def test_file_created_with_decoded_ccache_and_0600_permissions(self) -> None:
+        http_client = _krb5_client_for()
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        with await client.ticket_file("bearer") as handle:
+            assert handle.path.exists()
+            assert handle.path.read_bytes() == _CCACHE_BYTES
+            mode = stat.S_IMODE(handle.path.stat().st_mode)
+            assert mode == 0o600
+            assert handle.principal == _PRINCIPAL
+            assert handle.realm == _REALM
+
+    async def test_directory_created_with_0700_permissions(self) -> None:
+        http_client = _krb5_client_for()
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        with await client.ticket_file("bearer") as handle:
+            mode = stat.S_IMODE(handle.path.parent.stat().st_mode)
+            assert mode == 0o700
+
+    async def test_context_manager_deletes_file_on_exit(self) -> None:
+        http_client = _krb5_client_for()
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        handle = await client.ticket_file("bearer")
+        path = handle.path
+        assert path.exists()
+        with handle:
+            pass
+        assert not path.exists()
+
+    async def test_renew_until_surfaced_when_present(self) -> None:
+        http_client = _krb5_client_for()
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        with await client.ticket_file("bearer") as handle:
+            assert handle.renew_until is not None
+
+    async def test_renew_until_none_when_not_renewable(self) -> None:
+        http_client = _krb5_client_for(response_kwargs={"renew_until": None})
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        with await client.ticket_file("bearer") as handle:
+            assert handle.renew_until is None
+
+    async def test_two_calls_get_independent_handles(self) -> None:
+        http_client = _krb5_client_for()
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        first = await client.ticket_file("bearer")
+        second = await client.ticket_file("bearer")
+
+        assert first.path != second.path
+        first.close()
+        assert second.path.exists()
+        second.close()
+
+
+class TestCcacheBytes:
+    async def test_returns_decoded_ccache_as_bytes(self) -> None:
+        http_client = _krb5_client_for()
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        result = await client.ccache_bytes("bearer")
+
+        assert result == _CCACHE_BYTES
+
+    async def test_does_not_write_any_file(self) -> None:
+        http_client = _krb5_client_for()
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        await client.ccache_bytes("bearer")
+
+        assert client._dir is None
+
+
+class TestKrb5NotAvailableAndErrors:
+    async def test_404_raises_ticket_not_available(self) -> None:
+        http_client = _krb5_client_for(
+            status_code=404, response_kwargs={"detail": "no linked credential"}
+        )
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        with pytest.raises(ProxyNotAvailableError, match="no linked"):
+            await client.ticket_file("bearer")
+
+    async def test_short_remaining_raises_not_available(self) -> None:
+        http_client = _krb5_client_for(response_kwargs={"remaining_seconds": 30})
+        client = ProxyClient(
+            BROKER_URL, kind="krb5", min_remaining=60.0, http_client=http_client
+        )
+
+        with pytest.raises(ProxyNotAvailableError, match="30"):
+            await client.ticket_file("bearer")
+
+    async def test_500_raises_redeem_error(self) -> None:
+        http_client = _krb5_client_for(
+            status_code=500, response_kwargs={"detail": "mint failed"}
+        )
+        client = ProxyClient(BROKER_URL, kind="krb5", http_client=http_client)
+
+        with pytest.raises(ProxyRedeemError, match="mint failed"):
+            await client.ticket_file("bearer")
 
 
 class TestProxyFileHappyPath:
