@@ -1,9 +1,9 @@
-"""Client for redeeming a brokered x509/VOMS proxy.
+"""Client for redeeming brokered x509/VOMS proxies and krb5 tickets (issue #112).
 
-Codes against a redeem contract the broker does not implement yet (issue
-#112): ``POST {broker_url}/v1/credentials/x509/redeem``, bearer-authenticated
-with an AF Broker Identity Token (see verifier.py), empty JSON body. A 200
-response is::
+Talks to the broker's credential redeem contract:
+``POST {broker_url}/v1/credentials/{kind}/redeem`` (``kind`` is ``"x509"``
+or ``"krb5"``), bearer-authenticated with an AF Broker Identity Token (see
+verifier.py), empty JSON body. A 200 response for ``kind="x509"`` is::
 
     {
       "pem": "<PEM-encoded proxy certificate + key>",
@@ -14,10 +14,22 @@ response is::
       "nickname": "<CERN/VOMS nickname attribute, or null if extraction failed>"
     }
 
+and for ``kind="krb5"``::
+
+    {
+      "ccache_b64": "<base64-encoded ccache file contents>",
+      "principal": "<krb5 principal>",
+      "realm": "<krb5 realm>",
+      "expires_at": "<ISO-8601 timestamp>",
+      "remaining_seconds": <int>,
+      "renew_until": "<ISO-8601 timestamp, or null if not renewable>"
+    }
+
 Mirrors the broker's own credential-brokering shape (x509/VOMS proxies
-minted via ephemeral k8s Jobs, docs/auth.md's "Critical auth constraint"
-section) without importing anything broker-side: this client only ever
-talks HTTP to ``{broker_url}``.
+minted via ephemeral k8s Jobs, krb5 tickets minted via its own token
+service -- see docs/auth.md's "Critical auth constraint" section) without
+importing anything broker-side: this client only ever talks HTTP to
+``{broker_url}``.
 """
 
 from __future__ import annotations
@@ -42,14 +54,15 @@ _REDEEM_PATH_TEMPLATE = "/v1/credentials/{kind}/redeem"
 
 
 class ProxyNotAvailableError(Exception):
-    """No usable proxy is available for this caller right now.
+    """No usable credential is available for this caller right now.
 
     Raised when the broker answers 404 (e.g. the caller has no linked
-    ``.globus`` credential to mint a proxy from) or when it did mint one
-    but its remaining validity is below the caller's ``min_remaining``
-    floor -- in both cases the caller's fix is "try a different credential
-    or come back later," not "retry this exact call," which is what
-    distinguishes this from ``ProxyRedeemError``.
+    ``.globus`` credential to mint a proxy from, or no linked credential to
+    mint a krb5 ticket from) or when it did mint one but its remaining
+    validity is below the caller's ``min_remaining`` floor -- in both cases
+    the caller's fix is "try a different credential or come back later,"
+    not "retry this exact call," which is what distinguishes this from
+    ``ProxyRedeemError``.
     """
 
     def __init__(self, detail: str) -> None:
@@ -58,7 +71,7 @@ class ProxyNotAvailableError(Exception):
 
 
 class ProxyRedeemError(Exception):
-    """The broker rejected or failed the redeem call for a reason other than "no proxy available" (a non-404, non-200 response)."""
+    """The broker rejected or failed the redeem call for a reason other than "no credential available" (a non-404, non-200 response)."""
 
     def __init__(self, status_code: int, detail: str) -> None:
         super().__init__(f"proxy redeem failed with status {status_code}: {detail}")
@@ -293,7 +306,7 @@ class ProxyClient:
         remaining = data["remaining_seconds"]
         if remaining < self._min_remaining:
             raise ProxyNotAvailableError(
-                f"redeemed proxy has only {remaining}s remaining "
+                f"redeemed {self._kind} credential has only {remaining}s remaining "
                 f"(minimum {self._min_remaining}s required)"
             )
         return data

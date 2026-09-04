@@ -1,8 +1,8 @@
 """Tests for ProxyClient (af_credentials.proxy): the client side of the
-x509/VOMS proxy redeem contract this library codes against --
-``POST {broker_url}/v1/credentials/x509/redeem`` (to be implemented broker-
-side; see the module docstring in proxy.py and this package's README for
-the exact request/response shape).
+x509/VOMS proxy and krb5 ticket redeem contracts --
+``POST {broker_url}/v1/credentials/{x509,krb5}/redeem`` (see the module
+docstring in proxy.py and this package's README for the exact
+request/response shapes).
 """
 
 from __future__ import annotations
