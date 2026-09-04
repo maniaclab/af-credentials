@@ -192,7 +192,8 @@ A 200 response for `kind="x509"`:
   "dn": "<VOMS proxy subject DN>",
   "voms_attributes": ["<VOMS FQAN>", "..."],
   "expires_at": "<ISO-8601 timestamp>",
-  "remaining_seconds": 3600
+  "remaining_seconds": 3600,
+  "nickname": "<CERN/VOMS nickname attribute, or null if extraction failed>"
 }
 ```
 
