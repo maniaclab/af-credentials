@@ -1,9 +1,9 @@
-"""Client for redeeming a brokered x509/VOMS proxy.
+"""Client for redeeming brokered x509/VOMS proxies and krb5 tickets (issue #112).
 
-Codes against a redeem contract the broker does not implement yet (issue
-#112): ``POST {broker_url}/v1/credentials/x509/redeem``, bearer-authenticated
-with an AF Broker Identity Token (see verifier.py), empty JSON body. A 200
-response is::
+Talks to the broker's credential redeem contract:
+``POST {broker_url}/v1/credentials/{kind}/redeem`` (``kind`` is ``"x509"``
+or ``"krb5"``), bearer-authenticated with an AF Broker Identity Token (see
+verifier.py), empty JSON body. A 200 response for ``kind="x509"`` is::
 
     {
       "pem": "<PEM-encoded proxy certificate + key>",
@@ -14,21 +14,34 @@ response is::
       "nickname": "<CERN/VOMS nickname attribute, or null if extraction failed>"
     }
 
+and for ``kind="krb5"``::
+
+    {
+      "ccache_b64": "<base64-encoded ccache file contents>",
+      "principal": "<krb5 principal>",
+      "realm": "<krb5 realm>",
+      "expires_at": "<ISO-8601 timestamp>",
+      "remaining_seconds": <int>,
+      "renew_until": "<ISO-8601 timestamp, or null if not renewable>"
+    }
+
 Mirrors the broker's own credential-brokering shape (x509/VOMS proxies
-minted via ephemeral k8s Jobs, docs/auth.md's "Critical auth constraint"
-section) without importing anything broker-side: this client only ever
-talks HTTP to ``{broker_url}``.
+minted via ephemeral k8s Jobs, krb5 tickets minted via its own token
+service -- see docs/auth.md's "Critical auth constraint" section) without
+importing anything broker-side: this client only ever talks HTTP to
+``{broker_url}``.
 """
 
 from __future__ import annotations
 
+import base64
 import os
 import stat
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx2
 
@@ -37,18 +50,19 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
-_REDEEM_PATH = "/v1/credentials/x509/redeem"
+_REDEEM_PATH_TEMPLATE = "/v1/credentials/{kind}/redeem"
 
 
 class ProxyNotAvailableError(Exception):
-    """No usable proxy is available for this caller right now.
+    """No usable credential is available for this caller right now.
 
     Raised when the broker answers 404 (e.g. the caller has no linked
-    ``.globus`` credential to mint a proxy from) or when it did mint one
-    but its remaining validity is below the caller's ``min_remaining``
-    floor -- in both cases the caller's fix is "try a different credential
-    or come back later," not "retry this exact call," which is what
-    distinguishes this from ``ProxyRedeemError``.
+    ``.globus`` credential to mint a proxy from, or no linked credential to
+    mint a krb5 ticket from) or when it did mint one but its remaining
+    validity is below the caller's ``min_remaining`` floor -- in both cases
+    the caller's fix is "try a different credential or come back later,"
+    not "retry this exact call," which is what distinguishes this from
+    ``ProxyRedeemError``.
     """
 
     def __init__(self, detail: str) -> None:
@@ -57,7 +71,7 @@ class ProxyNotAvailableError(Exception):
 
 
 class ProxyRedeemError(Exception):
-    """The broker rejected or failed the redeem call for a reason other than "no proxy available" (a non-404, non-200 response)."""
+    """The broker rejected or failed the redeem call for a reason other than "no credential available" (a non-404, non-200 response)."""
 
     def __init__(self, status_code: int, detail: str) -> None:
         super().__init__(f"proxy redeem failed with status {status_code}: {detail}")
@@ -111,28 +125,70 @@ class ProxyHandle:
         self.close()
 
 
-class ProxyClient:
-    """Redeems brokered x509/VOMS proxies from an AF MCP broker.
+@dataclass
+class TicketHandle:
+    """A materialized krb5 ccache on disk.
 
-    Materialized proxy files live under a private, 0700 directory created
-    lazily on first use (one per ``ProxyClient`` instance, reused across
-    calls); each file inside it is written 0600. *min_remaining* rejects a
-    freshly-redeemed proxy whose ``remaining_seconds`` is already below a
-    useful floor -- a caller who then retried "the credential I just got"
-    would just get the same near-expired proxy back (the broker caches it),
-    so this is reported as ``ProxyNotAvailableError`` rather than handed to
-    the caller as if it were usable.
+    A context manager: ``__exit__``/``close()`` deletes the underlying
+    file. Not cached by ``ProxyClient`` -- every ``ticket_file()`` call
+    returns its own handle over its own file (the broker itself caches the
+    ticket; this client does not cache handles across calls).
+    """
+
+    path: Path
+    principal: str
+    realm: str
+    expires_at: datetime
+    renew_until: datetime | None
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def close(self) -> None:
+        """Delete the underlying file. Safe to call more than once."""
+        if not self._closed:
+            self.path.unlink(missing_ok=True)
+            self._closed = True
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+
+class ProxyClient:
+    """Redeems brokered x509/VOMS proxies or krb5 tickets from an AF MCP broker.
+
+    Materialized credential files live under a private, 0700 directory
+    created lazily on first use (one per ``ProxyClient`` instance, reused
+    across calls); each file inside it is written 0600. *min_remaining*
+    rejects a freshly-redeemed credential whose ``remaining_seconds`` is
+    already below a useful floor -- a caller who then retried "the
+    credential I just got" would just get the same near-expired credential
+    back (the broker caches it), so this is reported as
+    ``ProxyNotAvailableError`` rather than handed to the caller as if it
+    were usable.
     """
 
     def __init__(
         self,
         broker_url: str,
         *,
+        kind: Literal["x509", "krb5"] = "x509",
         timeout: float = 10.0,
         min_remaining: float = 60.0,
         http_client: httpx2.AsyncClient | None = None,
     ) -> None:
         """Construct a client against *broker_url* (e.g. ``https://mcp.af.uchicago.edu``).
+
+        *kind* selects which credential this client redeems: ``"x509"``
+        (the default, for ``proxy_file()``/``pem_bytes()``) or ``"krb5"``
+        (for ``ticket_file()``/``ccache_bytes()``). Calling a method for the
+        other kind raises ``ValueError``.
 
         *http_client*, when given, is used for the redeem call instead of a
         short-lived client created per call -- primarily a test seam
@@ -141,6 +197,7 @@ class ProxyClient:
         never closes an injected ``http_client``.
         """
         self._broker_url = broker_url.rstrip("/")
+        self._kind = kind
         self._timeout = timeout
         self._min_remaining = min_remaining
         self._http_client = http_client
@@ -148,6 +205,10 @@ class ProxyClient:
 
     async def proxy_file(self, bearer: str) -> ProxyHandle:
         """Redeem a proxy and materialize it as a private 0600 file, returning a handle whose ``close()`` deletes it."""
+        if self._kind != "x509":
+            raise ValueError(
+                f"proxy_file() requires kind='x509', but this client was constructed with kind={self._kind!r}"
+            )
         data = await self._redeem(bearer)
         directory = self._ensure_dir()
         fd, raw_path = tempfile.mkstemp(dir=directory, prefix="proxy-", suffix=".pem")
@@ -168,9 +229,54 @@ class ProxyClient:
 
     async def pem_bytes(self, bearer: str) -> bytes:
         """Redeem a proxy and return its PEM material in-memory, without writing a file."""
+        if self._kind != "x509":
+            raise ValueError(
+                f"pem_bytes() requires kind='x509', but this client was constructed with kind={self._kind!r}"
+            )
         data = await self._redeem(bearer)
         pem: str = data["pem"]
         return pem.encode()
+
+    async def ticket_file(self, bearer: str) -> TicketHandle:
+        """Redeem a krb5 ticket and materialize its ccache as a private 0600 file, returning a handle whose ``close()`` deletes it."""
+        if self._kind != "krb5":
+            raise ValueError(
+                f"ticket_file() requires kind='krb5', but this client was constructed with kind={self._kind!r}"
+            )
+        data = await self._redeem(bearer)
+        ccache = base64.b64decode(data["ccache_b64"])
+        directory = self._ensure_dir()
+        fd, raw_path = tempfile.mkstemp(
+            dir=directory, prefix="krb5cc-", suffix=".ccache"
+        )
+        path = Path(raw_path)
+        try:
+            with os.fdopen(fd, "wb") as ccache_file:
+                ccache_file.write(ccache)
+            path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        except OSError:
+            path.unlink(missing_ok=True)
+            raise
+        renew_until = data["renew_until"]
+        return TicketHandle(
+            path=path,
+            principal=data["principal"],
+            realm=data["realm"],
+            expires_at=_parse_iso8601(data["expires_at"]),
+            renew_until=_parse_iso8601(renew_until)
+            if renew_until is not None
+            else None,
+        )
+
+    async def ccache_bytes(self, bearer: str) -> bytes:
+        """Redeem a krb5 ticket and return its ccache material in-memory, without writing a file."""
+        if self._kind != "krb5":
+            raise ValueError(
+                f"ccache_bytes() requires kind='krb5', but this client was constructed with kind={self._kind!r}"
+            )
+        data = await self._redeem(bearer)
+        ccache_b64: str = data["ccache_b64"]
+        return base64.b64decode(ccache_b64)
 
     def _ensure_dir(self) -> Path:
         if self._dir is None:
@@ -181,7 +287,7 @@ class ProxyClient:
         return self._dir
 
     async def _redeem(self, bearer: str) -> dict[str, Any]:
-        url = f"{self._broker_url}{_REDEEM_PATH}"
+        url = f"{self._broker_url}{_REDEEM_PATH_TEMPLATE.format(kind=self._kind)}"
         headers = {"Authorization": f"Bearer {bearer}"}
         if self._http_client is not None:
             response = await self._http_client.post(
@@ -200,7 +306,7 @@ class ProxyClient:
         remaining = data["remaining_seconds"]
         if remaining < self._min_remaining:
             raise ProxyNotAvailableError(
-                f"redeemed proxy has only {remaining}s remaining "
+                f"redeemed {self._kind} credential has only {remaining}s remaining "
                 f"(minimum {self._min_remaining}s required)"
             )
         return data

@@ -13,11 +13,12 @@
 <!-- --8<-- [start:intro] -->
 
 Backend-side client for the AF MCP platform's broker-issued credentials (issue
-#112). Import package: `af_credentials`. No dependency on `af_mcp_broker`,
-FastAPI, or Kubernetes — this is meant to be embedded in _other_ MCP backends
-that need to trust the broker (ami-mcp's broker mode today, later rucio-mcp), so
-it stays deliberately thin: `pyjwt[crypto]` and `httpx2` at runtime,
-`mcp>=2.0.0,<3` opt-in via the `[mcp]` extra.
+#112), covering both x509/VOMS proxies and krb5 tickets. Import package:
+`af_credentials`. No dependency on `af_mcp_broker`, FastAPI, or Kubernetes —
+this is meant to be embedded in _other_ MCP backends that need to trust the
+broker (ami-mcp's broker mode today, later rucio-mcp), so it stays deliberately
+thin: `pyjwt[crypto]` and `httpx2` at runtime, `mcp>=2.0.0,<3` opt-in via the
+`[mcp]` extra.
 
 <!-- --8<-- [end:intro] -->
 
@@ -115,14 +116,15 @@ token's `sub`) itself, not from this adapter's output.
 
 ## `ProxyClient` (`af_credentials.proxy`)
 
-Redeems a brokered x509/VOMS proxy. **Codes against a contract the broker does
-not implement yet** (issue #112) — the redeem endpoint below is a specification
-for the broker-side work to land against, not a live API.
+Redeems a brokered x509/VOMS proxy or krb5 ticket. `ProxyClient` takes a
+`kind: Literal["x509", "krb5"] = "x509"` constructor parameter that selects
+which credential the client redeems; the redeem endpoint is live in the broker
+(see "The redeem contract" below).
 
 ```python
 from af_credentials.proxy import ProxyClient, ProxyNotAvailableError, ProxyRedeemError
 
-client = ProxyClient("https://mcp.af.uchicago.edu")
+client = ProxyClient("https://mcp.af.uchicago.edu")  # kind="x509" by default
 
 try:
     with await client.proxy_file(bearer_token) as handle:
@@ -141,17 +143,48 @@ except ProxyRedeemError as exc:
 Use `pem_bytes(bearer_token)` instead of `proxy_file()` when the caller wants
 the PEM material in-memory rather than as a file.
 
+For krb5 tickets, construct the client with `kind="krb5"` and use
+`ticket_file()`/`ccache_bytes()` instead — `proxy_file()`/`pem_bytes()` raise
+`ValueError` on a `kind="krb5"` client, and `ticket_file()`/`ccache_bytes()`
+raise the same kind of guard error on a `kind="x509"` client:
+
+```python
+from af_credentials.proxy import ProxyClient, ProxyNotAvailableError, ProxyRedeemError
+
+client = ProxyClient("https://mcp.af.uchicago.edu", kind="krb5")
+
+try:
+    with await client.ticket_file(bearer_token) as handle:
+        # handle.path        -> Path to a private 0600 ccache file
+        # handle.principal   -> krb5 principal, e.g. "gstark@CERN.CH"
+        # handle.realm       -> krb5 realm, e.g. "CERN.CH"
+        # handle.expires_at  -> datetime
+        # handle.renew_until -> datetime, or None if not renewable
+        run_subprocess(env={"KRB5CCNAME": str(handle.path)})
+    # file is deleted here, on __exit__
+except ProxyNotAvailableError:
+    ...  # no ticket available for this caller right now (no linked krb5-token
+    # identity, or the broker's own cached ticket is too close to expiry)
+except ProxyRedeemError as exc:
+    ...  # the broker rejected/failed the call; exc.status_code, exc.detail
+```
+
+Use `ccache_bytes(bearer_token)` instead of `ticket_file()` when the caller
+wants the ccache material in-memory rather than as a file.
+
 ### The redeem contract
 
 ```
-POST {broker_url}/v1/credentials/x509/redeem
+POST {broker_url}/v1/credentials/{kind}/redeem
 Authorization: Bearer <token>
 Content-Type: application/json
 
 {}
 ```
 
-A 200 response:
+where `{kind}` is `x509` or `krb5`, matching the `ProxyClient`'s own `kind`.
+
+A 200 response for `kind="x509"`:
 
 ```json
 {
@@ -159,23 +192,39 @@ A 200 response:
   "dn": "<VOMS proxy subject DN>",
   "voms_attributes": ["<VOMS FQAN>", "..."],
   "expires_at": "<ISO-8601 timestamp>",
-  "remaining_seconds": 3600
+  "remaining_seconds": 3600,
+  "nickname": "<CERN/VOMS nickname attribute, or null if extraction failed>"
 }
 ```
+
+and for `kind="krb5"`:
+
+```json
+{
+  "ccache_b64": "<base64-encoded ccache file contents>",
+  "principal": "<krb5 principal, e.g. gstark@CERN.CH>",
+  "realm": "<krb5 realm, e.g. CERN.CH>",
+  "expires_at": "<ISO-8601 timestamp>",
+  "remaining_seconds": 3600,
+  "renew_until": "<ISO-8601 timestamp, or null if not renewable>"
+}
+```
+
+The following applies identically to both kinds, via the same `_redeem()` call:
 
 - **404** → `ProxyNotAvailableError(detail)` — the response's `detail` field (or
   raw body if not JSON) is the exception's `.detail`.
 - Any other non-200 → `ProxyRedeemError(status_code, detail)`.
 - A 200 response whose `remaining_seconds` is below the client's `min_remaining`
   (default 60s) is _also_ treated as `ProxyNotAvailableError` — the broker
-  caches the proxy itself, so a caller who retried "the credential I just got"
-  would just get the same near-expired proxy back.
+  caches the credential itself, so a caller who retried "the credential I just
+  got" would just get the same near-expired proxy or ticket back.
 
 `ProxyClient` never caches handles across calls — every `proxy_file()`/
-`pem_bytes()` call redeems fresh (the broker is expected to be the one doing the
-caching). Materialized files live under a private, 0700 directory created lazily
-on first use and reused for the lifetime of the `ProxyClient` instance; each
-file inside it is written 0600.
+`pem_bytes()`/`ticket_file()`/`ccache_bytes()` call redeems fresh (the broker is
+expected to be the one doing the caching). Materialized files live under a
+private, 0700 directory created lazily on first use and reused for the lifetime
+of the `ProxyClient` instance; each file inside it is written 0600.
 
 <!-- --8<-- [end:usage] -->
 
