@@ -14,7 +14,7 @@ verifier.py), empty JSON body. A 200 response for ``kind="x509"`` is::
       "nickname": "<CERN/VOMS nickname attribute, or null if extraction failed>"
     }
 
-and for ``kind="krb5"``::
+for ``kind="krb5"``::
 
     {
       "ccache_b64": "<base64-encoded ccache file contents>",
@@ -25,11 +25,24 @@ and for ``kind="krb5"``::
       "renew_until": "<ISO-8601 timestamp, or null if not renewable>"
     }
 
+and for ``kind="servicex"``::
+
+    {
+      "access_token": "<short-lived ServiceX access token>",
+      "expires_at": "<ISO-8601 timestamp>",
+      "remaining_seconds": <int>
+    }
+
+(the ``remaining_seconds``/``expires_at`` pair is normalized onto the same
+shape ``x509``/``krb5`` already use, rather than reusing
+``servicex-token-service``'s own ``/v1/redeem`` response verbatim -- see
+``ServiceXAccessToken`` below.)
+
 Mirrors the broker's own credential-brokering shape (x509/VOMS proxies
 minted via ephemeral k8s Jobs, krb5 tickets minted via its own token
-service -- see docs/auth.md's "Critical auth constraint" section) without
-importing anything broker-side: this client only ever talks HTTP to
-``{broker_url}``.
+service, ServiceX access tokens redeemed via servicex-token-service -- see
+docs/auth.md's "Critical auth constraint" section) without importing
+anything broker-side: this client only ever talks HTTP to ``{broker_url}``.
 """
 
 from __future__ import annotations
@@ -125,6 +138,20 @@ class ProxyHandle:
         self.close()
 
 
+@dataclass(frozen=True)
+class ServiceXAccessToken:
+    """A redeemed, short-lived ServiceX access token.
+
+    Unlike :class:`ProxyHandle`/:class:`TicketHandle`, nothing is
+    materialized on disk here -- this is a bearer token meant to be handed
+    directly to a ``ServiceXAdapter``/``ServiceXClient``, so there is no
+    ``close()``/context-manager to clean up.
+    """
+
+    access_token: str
+    expires_at: datetime
+
+
 @dataclass
 class TicketHandle:
     """A materialized krb5 ccache on disk.
@@ -178,7 +205,7 @@ class ProxyClient:
         self,
         broker_url: str,
         *,
-        kind: Literal["x509", "krb5"] = "x509",
+        kind: Literal["x509", "krb5", "servicex"] = "x509",
         timeout: float = 10.0,
         min_remaining: float = 60.0,
         http_client: httpx2.AsyncClient | None = None,
@@ -186,9 +213,10 @@ class ProxyClient:
         """Construct a client against *broker_url* (e.g. ``https://mcp.af.uchicago.edu``).
 
         *kind* selects which credential this client redeems: ``"x509"``
-        (the default, for ``proxy_file()``/``pem_bytes()``) or ``"krb5"``
-        (for ``ticket_file()``/``ccache_bytes()``). Calling a method for the
-        other kind raises ``ValueError``.
+        (the default, for ``proxy_file()``/``pem_bytes()``), ``"krb5"``
+        (for ``ticket_file()``/``ccache_bytes()``), or ``"servicex"`` (for
+        ``access_token()``). Calling a method for another kind raises
+        ``ValueError``.
 
         *http_client*, when given, is used for the redeem call instead of a
         short-lived client created per call -- primarily a test seam
@@ -277,6 +305,18 @@ class ProxyClient:
         data = await self._redeem(bearer)
         ccache_b64: str = data["ccache_b64"]
         return base64.b64decode(ccache_b64)
+
+    async def access_token(self, bearer: str) -> ServiceXAccessToken:
+        """Redeem a ServiceX access token. Requires ``kind="servicex"``."""
+        if self._kind != "servicex":
+            raise ValueError(
+                f"access_token() requires kind='servicex', but this client was constructed with kind={self._kind!r}"
+            )
+        data = await self._redeem(bearer)
+        return ServiceXAccessToken(
+            access_token=data["access_token"],
+            expires_at=_parse_iso8601(data["expires_at"]),
+        )
 
     def _ensure_dir(self) -> Path:
         if self._dir is None:

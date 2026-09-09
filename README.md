@@ -116,10 +116,10 @@ token's `sub`) itself, not from this adapter's output.
 
 ## `ProxyClient` (`af_credentials.proxy`)
 
-Redeems a brokered x509/VOMS proxy or krb5 ticket. `ProxyClient` takes a
-`kind: Literal["x509", "krb5"] = "x509"` constructor parameter that selects
-which credential the client redeems; the redeem endpoint is live in the broker
-(see "The redeem contract" below).
+Redeems a brokered x509/VOMS proxy, krb5 ticket, or ServiceX access token.
+`ProxyClient` takes a `kind: Literal["x509", "krb5", "servicex"] = "x509"`
+constructor parameter that selects which credential the client redeems; the
+redeem endpoint is live in the broker (see "The redeem contract" below).
 
 ```python
 from af_credentials.proxy import ProxyClient, ProxyNotAvailableError, ProxyRedeemError
@@ -172,6 +172,27 @@ except ProxyRedeemError as exc:
 Use `ccache_bytes(bearer_token)` instead of `ticket_file()` when the caller
 wants the ccache material in-memory rather than as a file.
 
+For a ServiceX access token, construct the client with `kind="servicex"` and use
+`access_token()` — there is no file to materialize (it's a bearer token, not key
+material), so this returns a `ServiceXAccessToken` directly rather than a
+context-managed handle:
+
+```python
+from af_credentials.proxy import ProxyClient, ProxyNotAvailableError, ProxyRedeemError
+
+client = ProxyClient("https://mcp.af.uchicago.edu", kind="servicex")
+
+try:
+    token = await client.access_token(bearer_token)
+    # token.access_token -> the short-lived ServiceX access token (str)
+    # token.expires_at   -> datetime
+except ProxyNotAvailableError:
+    ...  # no ServiceX refresh token linked for this caller right now, or
+    # the broker's own redeemed token is too close to expiry
+except ProxyRedeemError as exc:
+    ...  # the broker rejected/failed the call; exc.status_code, exc.detail
+```
+
 ### The redeem contract
 
 ```
@@ -182,7 +203,8 @@ Content-Type: application/json
 {}
 ```
 
-where `{kind}` is `x509` or `krb5`, matching the `ProxyClient`'s own `kind`.
+where `{kind}` is `x509`, `krb5`, or `servicex`, matching the `ProxyClient`'s
+own `kind`.
 
 A 200 response for `kind="x509"`:
 
@@ -210,7 +232,18 @@ and for `kind="krb5"`:
 }
 ```
 
-The following applies identically to both kinds, via the same `_redeem()` call:
+and for `kind="servicex"`:
+
+```json
+{
+  "access_token": "<short-lived ServiceX access token>",
+  "expires_at": "<ISO-8601 timestamp>",
+  "remaining_seconds": 3600
+}
+```
+
+The following applies identically to all three kinds, via the same `_redeem()`
+call:
 
 - **404** → `ProxyNotAvailableError(detail)` — the response's `detail` field (or
   raw body if not JSON) is the exception's `.detail`.
@@ -221,10 +254,11 @@ The following applies identically to both kinds, via the same `_redeem()` call:
   got" would just get the same near-expired proxy or ticket back.
 
 `ProxyClient` never caches handles across calls — every `proxy_file()`/
-`pem_bytes()`/`ticket_file()`/`ccache_bytes()` call redeems fresh (the broker is
-expected to be the one doing the caching). Materialized files live under a
-private, 0700 directory created lazily on first use and reused for the lifetime
-of the `ProxyClient` instance; each file inside it is written 0600.
+`pem_bytes()`/`ticket_file()`/`ccache_bytes()`/`access_token()` call redeems
+fresh (the broker is expected to be the one doing the caching). Materialized
+files live under a private, 0700 directory created lazily on first use and
+reused for the lifetime of the `ProxyClient` instance; each file inside it is
+written 0600 (`access_token()` writes no file at all).
 
 <!-- --8<-- [end:usage] -->
 
