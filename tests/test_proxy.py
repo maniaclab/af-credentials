@@ -15,7 +15,12 @@ from typing import Any
 import httpx2
 import pytest
 
-from af_credentials.proxy import ProxyClient, ProxyNotAvailableError, ProxyRedeemError
+from af_credentials.proxy import (
+    ProxyClient,
+    ProxyNotAvailableError,
+    ProxyRedeemError,
+    ServiceXAccessToken,
+)
 
 BROKER_URL = "https://broker.af.example.org"
 _REDEEM_PATH = "/v1/credentials/x509/redeem"
@@ -97,6 +102,40 @@ def _krb5_client_for(
     return httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
 
 
+_ACCESS_TOKEN = "eyJhbGciOiJSUzI1NiJ9.fake-servicex-access-token"
+
+
+def _servicex_redeem_response(
+    *,
+    status_code: int = 200,
+    remaining_seconds: int = 3600,
+    detail: str | None = None,
+) -> dict[str, object]:
+    if status_code != 200:
+        return {"detail": detail or "error"}
+    return {
+        "access_token": _ACCESS_TOKEN,
+        "expires_at": _EXPIRES_AT,
+        "remaining_seconds": remaining_seconds,
+    }
+
+
+def _servicex_client_for(
+    response_kwargs: dict[str, Any] | None = None,
+    *,
+    status_code: int = 200,
+    captured_requests: list[httpx2.Request] | None = None,
+) -> httpx2.AsyncClient:
+    body = _servicex_redeem_response(status_code=status_code, **(response_kwargs or {}))
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if captured_requests is not None:
+            captured_requests.append(request)
+        return httpx2.Response(status_code, json=body)
+
+    return httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+
+
 class TestKindParameter:
     async def test_default_kind_is_x509_and_posts_to_x509_path(self) -> None:
         requests: list[httpx2.Request] = []
@@ -124,6 +163,15 @@ class TestKindParameter:
 
         assert str(requests[0].url) == f"{BROKER_URL}/v1/credentials/krb5/redeem"
 
+    async def test_explicit_servicex_kind_posts_to_servicex_path(self) -> None:
+        requests: list[httpx2.Request] = []
+        http_client = _servicex_client_for(captured_requests=requests)
+        client = ProxyClient(BROKER_URL, kind="servicex", http_client=http_client)
+
+        await client.access_token("bearer")
+
+        assert str(requests[0].url) == f"{BROKER_URL}/v1/credentials/servicex/redeem"
+
 
 class TestKindGuards:
     async def test_proxy_file_on_krb5_client_raises(self) -> None:
@@ -149,6 +197,30 @@ class TestKindGuards:
 
         with pytest.raises(ValueError, match="x509"):
             await client.ccache_bytes("bearer")
+
+    async def test_access_token_on_x509_client_raises(self) -> None:
+        client = ProxyClient(BROKER_URL)  # default kind="x509"
+
+        with pytest.raises(ValueError, match="x509"):
+            await client.access_token("bearer")
+
+    async def test_access_token_on_krb5_client_raises(self) -> None:
+        client = ProxyClient(BROKER_URL, kind="krb5")
+
+        with pytest.raises(ValueError, match="krb5"):
+            await client.access_token("bearer")
+
+    async def test_proxy_file_on_servicex_client_raises(self) -> None:
+        client = ProxyClient(BROKER_URL, kind="servicex")
+
+        with pytest.raises(ValueError, match="servicex"):
+            await client.proxy_file("bearer")
+
+    async def test_ticket_file_on_servicex_client_raises(self) -> None:
+        client = ProxyClient(BROKER_URL, kind="servicex")
+
+        with pytest.raises(ValueError, match="servicex"):
+            await client.ticket_file("bearer")
 
 
 class TestTicketFileHappyPath:
@@ -444,6 +516,75 @@ class TestProxyRedeemError:
         with pytest.raises(ProxyRedeemError) as exc_info:
             await client.proxy_file("bearer")
         assert exc_info.value.status_code == 500
+
+
+class TestAccessTokenHappyPath:
+    async def test_sends_expected_request(self) -> None:
+        requests: list[httpx2.Request] = []
+        http_client = _servicex_client_for(captured_requests=requests)
+        client = ProxyClient(BROKER_URL, kind="servicex", http_client=http_client)
+
+        await client.access_token("my-bearer-token")
+
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.method == "POST"
+        assert str(request.url) == f"{BROKER_URL}/v1/credentials/servicex/redeem"
+        assert request.headers["authorization"] == "Bearer my-bearer-token"
+        assert request.content == b"{}"
+
+    async def test_returns_servicex_access_token(self) -> None:
+        http_client = _servicex_client_for()
+        client = ProxyClient(BROKER_URL, kind="servicex", http_client=http_client)
+
+        result = await client.access_token("bearer")
+
+        assert isinstance(result, ServiceXAccessToken)
+        assert result.access_token == _ACCESS_TOKEN
+        assert result.expires_at == _parse_iso8601_for_test(_EXPIRES_AT)
+
+    async def test_does_not_write_any_file(self) -> None:
+        http_client = _servicex_client_for()
+        client = ProxyClient(BROKER_URL, kind="servicex", http_client=http_client)
+
+        await client.access_token("bearer")
+
+        assert client._dir is None
+
+
+def _parse_iso8601_for_test(value: str) -> datetime:
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return datetime.fromisoformat(value)
+
+
+class TestServiceXNotAvailableAndErrors:
+    async def test_404_raises_not_available(self) -> None:
+        http_client = _servicex_client_for(
+            status_code=404, response_kwargs={"detail": "no linked refresh token"}
+        )
+        client = ProxyClient(BROKER_URL, kind="servicex", http_client=http_client)
+
+        with pytest.raises(ProxyNotAvailableError, match="no linked"):
+            await client.access_token("bearer")
+
+    async def test_short_remaining_raises_not_available(self) -> None:
+        http_client = _servicex_client_for(response_kwargs={"remaining_seconds": 30})
+        client = ProxyClient(
+            BROKER_URL, kind="servicex", min_remaining=60.0, http_client=http_client
+        )
+
+        with pytest.raises(ProxyNotAvailableError, match="30"):
+            await client.access_token("bearer")
+
+    async def test_500_raises_redeem_error(self) -> None:
+        http_client = _servicex_client_for(
+            status_code=500, response_kwargs={"detail": "redeem failed"}
+        )
+        client = ProxyClient(BROKER_URL, kind="servicex", http_client=http_client)
+
+        with pytest.raises(ProxyRedeemError, match="redeem failed"):
+            await client.access_token("bearer")
 
 
 class TestTransportErrorsPropagate:
