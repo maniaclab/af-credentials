@@ -118,6 +118,7 @@ class ProxyHandle:
     dn: str
     expires_at: datetime
     nickname: str | None
+    voms_attributes: list[str]
     _closed: bool = field(default=False, init=False, repr=False)
 
     def close(self) -> None:
@@ -253,6 +254,7 @@ class ProxyClient:
             dn=data["dn"],
             expires_at=_parse_iso8601(data["expires_at"]),
             nickname=data["nickname"],
+            voms_attributes=data["voms_attributes"],
         )
 
     async def pem_bytes(self, bearer: str) -> bytes:

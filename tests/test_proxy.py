@@ -41,13 +41,16 @@ def _redeem_response(
     remaining_seconds: int = 3600,
     detail: str | None = None,
     nickname: str | None = None,
+    voms_attributes: list[str] | None = None,
 ) -> dict[str, object]:
     if status_code != 200:
         return {"detail": detail or "error"}
     return {
         "pem": _PEM,
         "dn": _DN,
-        "voms_attributes": ["/atlas/Role=NULL/Capability=NULL"],
+        "voms_attributes": voms_attributes
+        if voms_attributes is not None
+        else ["/atlas/Role=NULL/Capability=NULL"],
         "expires_at": _EXPIRES_AT,
         "remaining_seconds": remaining_seconds,
         "nickname": nickname,
@@ -443,6 +446,43 @@ class TestProxyHandleNickname:
             "voms_attributes": ["/atlas/Role=NULL/Capability=NULL"],
             "expires_at": _EXPIRES_AT,
             "remaining_seconds": 3600,
+        }
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=body)
+
+        http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
+        client = ProxyClient(BROKER_URL, http_client=http_client)
+
+        with pytest.raises(KeyError):
+            await client.proxy_file("bearer")
+
+
+class TestProxyHandleVomsAttributes:
+    async def test_voms_attributes_surfaced_when_present(self) -> None:
+        http_client = _client_for(
+            response_kwargs={"voms_attributes": ["/atlas/Role=production"]}
+        )
+        client = ProxyClient(BROKER_URL, http_client=http_client)
+
+        with await client.proxy_file("bearer") as handle:
+            assert handle.voms_attributes == ["/atlas/Role=production"]
+
+    async def test_voms_attributes_empty_list_surfaced(self) -> None:
+        http_client = _client_for(response_kwargs={"voms_attributes": []})
+        client = ProxyClient(BROKER_URL, http_client=http_client)
+
+        with await client.proxy_file("bearer") as handle:
+            assert handle.voms_attributes == []
+
+    async def test_missing_voms_attributes_key_raises(self) -> None:
+        """The broker always sends `voms_attributes` -- an absent key is a broker bug this client does not tolerate."""
+        body = {
+            "pem": _PEM,
+            "dn": _DN,
+            "expires_at": _EXPIRES_AT,
+            "remaining_seconds": 3600,
+            "nickname": None,
         }
 
         def handler(request: httpx2.Request) -> httpx2.Response:

@@ -131,6 +131,8 @@ try:
         # handle.path   -> Path to a private 0600 PEM file (proxy cert + key)
         # handle.dn     -> VOMS proxy subject DN
         # handle.expires_at -> datetime
+        # handle.nickname -> CERN/VOMS nickname, or None if extraction failed
+        # handle.voms_attributes -> list[str] of VOMS FQANs
         run_subprocess(env={"X509_USER_PROXY": str(handle.path)})
     # file is deleted here, on __exit__
 except ProxyNotAvailableError:
