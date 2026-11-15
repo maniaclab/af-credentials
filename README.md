@@ -82,17 +82,24 @@ else:
 ```
 
 JWKS keys are cached in-process for `cache_ttl` seconds (default 300), keyed by
-`kid`. A token whose `kid` isn't in the current cache triggers **exactly one**
-refetch, to pick up a key rotated in since the last fetch (see the platform's
-key-rotation procedure) — if the refetched JWKS still doesn't carry that `kid`,
-verification fails without fetching again.
+`kid`. A token whose `kid` isn't in the current cache triggers an early refetch,
+to pick up a key rotated in since the last fetch (see the platform's
+key-rotation procedure), but at most one per `unknown_kid_cooldown` seconds
+(default 30), so forged `kid` values cannot turn every request into a JWKS
+fetch. A token whose `kid` is still unknown after that refetch, or while the
+cooldown runs, is rejected as invalid.
+
+If a refetch fails while keys are held, the held keys keep serving: known-`kid`
+tokens still verify, unknown-`kid` tokens are rejected, a warning is logged, and
+the next attempt waits out the same cooldown.
 
 `verify()` returns `None` for every way a token can be _invalid_ (bad signature,
 wrong issuer/audience, expired, malformed, unknown key), so callers can treat
-"not authenticated" uniformly. It does **not** catch transport failures — a JWKS
-fetch that can't connect, times out, or gets a non-2xx response raises the
-underlying `httpx2` exception, so a caller can tell "the broker is unreachable"
-apart from "this token is bad" and respond accordingly (e.g. a 503 vs. a 401).
+"not authenticated" uniformly. It does **not** catch transport failures when no
+keys are held yet (nothing fetched so far) — a JWKS fetch that can't connect,
+times out, or gets a non-2xx response raises the underlying `httpx2` exception,
+so a caller can tell "the broker is unreachable" apart from "this token is bad"
+and respond accordingly (e.g. a 503 vs. a 401).
 
 ### `mcp_token_verifier()` (`af_credentials.mcp`, requires the `[mcp]` extra)
 
