@@ -48,7 +48,7 @@ pixi add af-credentials
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - An AF MCP broker publishing a JWKS endpoint (for `BrokerTokenVerifier`)
 
 <!-- --8<-- [end:requirements] -->

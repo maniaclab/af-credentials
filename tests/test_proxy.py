@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 import stat
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx2
@@ -27,12 +27,12 @@ _REDEEM_PATH = "/v1/credentials/x509/redeem"
 
 _PEM = "-----BEGIN CERTIFICATE-----\nfake-proxy-material\n-----END CERTIFICATE-----\n"
 _DN = "/DC=ch/DC=cern/OU=Organic Units/OU=Users/CN=kratsg/CN=123456/CN=Giordon Stark"
-_EXPIRES_AT = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+_EXPIRES_AT = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
 
 _CCACHE_BYTES = b"fake-ccache-binary-content"
 _PRINCIPAL = "gstark@CERN.CH"
 _REALM = "CERN.CH"
-_RENEW_UNTIL = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+_RENEW_UNTIL = (datetime.now(UTC) + timedelta(days=7)).isoformat()
 
 
 def _redeem_response(
