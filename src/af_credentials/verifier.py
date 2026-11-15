@@ -116,6 +116,8 @@ class BrokerTokenVerifier:
         self._retry_after = 0.0
         # Monotonic time of the last early refetch for an unknown kid; None until the first.
         self._last_unknown_kid_refetch: float | None = None
+        # Monotonic time of the last ensure_keys() fetch attempt; None until the first.
+        self._last_ensure_keys_attempt: float | None = None
 
     async def verify(self, token: str) -> BrokerClaims | None:
         """Verify *token* and return its claims, or ``None`` if it is not a currently-valid AF Broker Identity Token for this verifier's issuer/audience.
@@ -169,6 +171,30 @@ class BrokerTokenVerifier:
             gid=claims.get("gid"),
             unixname=claims.get("unixname"),
         )
+
+    def has_keys(self) -> bool:
+        """Return whether the verifier currently holds any JWKS keys (for readiness checks); never fetches."""
+        return bool(self._keys_by_kid)
+
+    async def ensure_keys(self) -> bool:
+        """Fetch the JWKS only if no keys are held, and return whether keys are held afterwards (for readiness checks).
+
+        Never raises on a failed fetch. Attempts are spaced by
+        *unknown_kid_cooldown*, so a probe calling this on every request
+        does not turn an outage into a fetch per probe.
+        """
+        if self._keys_by_kid:
+            return True
+        now = time.monotonic()
+        last = self._last_ensure_keys_attempt
+        if last is not None and now - last < self._unknown_kid_cooldown:
+            return False
+        self._last_ensure_keys_attempt = now
+        try:
+            await self._refresh()
+        except (httpx2.HTTPError, KeyError, ValueError):
+            logger.warning("JWKS fetch from %s failed", self._jwks_url, exc_info=True)
+        return bool(self._keys_by_kid)
 
     async def _get_key(self, kid: str) -> dict[str, Any] | None:
         """Return the JWK for *kid*, refetching when the cache is stale or a rate-limited early refetch for an unknown *kid* is due."""

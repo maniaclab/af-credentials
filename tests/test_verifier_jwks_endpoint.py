@@ -191,3 +191,45 @@ class TestEndpointOutage:
         await asyncio.sleep(COOLDOWN + 0.05)
 
         assert await verifier.verify(rotated) is not None
+
+
+class TestReadinessApi:
+    async def test_has_keys_false_until_fetched_and_never_fetches(
+        self, jwks_server: JwksServer, rsa_keypair: rsa.RSAPrivateKey
+    ) -> None:
+        jwks_server.document = {"keys": [public_jwk(rsa_keypair.public_key())]}
+        verifier = _verifier(jwks_server)
+
+        assert verifier.has_keys() is False
+        assert jwks_server.fetches == 0
+
+        await verifier.verify(mint_token(rsa_keypair))
+        assert verifier.has_keys() is True
+
+    async def test_ensure_keys_fetches_once_then_is_free(
+        self, jwks_server: JwksServer, rsa_keypair: rsa.RSAPrivateKey
+    ) -> None:
+        jwks_server.document = {"keys": [public_jwk(rsa_keypair.public_key())]}
+        verifier = _verifier(jwks_server)
+
+        assert await verifier.ensure_keys() is True
+        assert await verifier.ensure_keys() is True
+        assert jwks_server.fetches == 1
+        assert await verifier.verify(mint_token(rsa_keypair)) is not None
+        assert jwks_server.fetches == 1
+
+    async def test_ensure_keys_rate_limited_while_endpoint_down(
+        self, jwks_server: JwksServer, rsa_keypair: rsa.RSAPrivateKey
+    ) -> None:
+        jwks_server.document = {"keys": [public_jwk(rsa_keypair.public_key())]}
+        jwks_server.healthy = False
+        verifier = _verifier(jwks_server, unknown_kid_cooldown=COOLDOWN)
+
+        for _ in range(10):
+            assert await verifier.ensure_keys() is False
+        assert jwks_server.fetches == 1
+
+        jwks_server.healthy = True
+        await asyncio.sleep(COOLDOWN + 0.05)
+        assert await verifier.ensure_keys() is True
+        assert verifier.has_keys() is True

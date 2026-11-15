@@ -93,6 +93,11 @@ If a refetch fails while keys are held, the held keys keep serving: known-`kid`
 tokens still verify, unknown-`kid` tokens are rejected, a warning is logged, and
 the next attempt waits out the same cooldown.
 
+For readiness probes, `has_keys()` reports whether any keys are held (never
+fetches), and `await ensure_keys()` fetches only when none are held, honours the
+same cooldown, never raises on a failed fetch, and returns whether keys are held
+afterwards.
+
 `verify()` returns `None` for every way a token can be _invalid_ (bad signature,
 wrong issuer/audience, expired, malformed, unknown key), so callers can treat
 "not authenticated" uniformly. It does **not** catch transport failures when no
