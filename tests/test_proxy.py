@@ -113,12 +113,13 @@ def _servicex_redeem_response(
     status_code: int = 200,
     remaining_seconds: int = 3600,
     detail: str | None = None,
+    expires_at: str = _EXPIRES_AT,
 ) -> dict[str, object]:
     if status_code != 200:
         return {"detail": detail or "error"}
     return {
         "access_token": _ACCESS_TOKEN,
-        "expires_at": _EXPIRES_AT,
+        "expires_at": expires_at,
         "remaining_seconds": remaining_seconds,
     }
 
@@ -581,7 +582,7 @@ class TestAccessTokenHappyPath:
 
         assert isinstance(result, ServiceXAccessToken)
         assert result.access_token == _ACCESS_TOKEN
-        assert result.expires_at == _parse_iso8601_for_test(_EXPIRES_AT)
+        assert result.expires_at == datetime.fromisoformat(_EXPIRES_AT)
 
     async def test_does_not_write_any_file(self) -> None:
         http_client = _servicex_client_for()
@@ -592,10 +593,50 @@ class TestAccessTokenHappyPath:
         assert client._dir is None
 
 
-def _parse_iso8601_for_test(value: str) -> datetime:
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    return datetime.fromisoformat(value)
+class TestExpiresAtParsing:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("2030-01-02T03:04:05Z", datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC)),
+            ("2030-01-02T03:04:05+00:00", datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC)),
+            (
+                "2030-01-02T03:04:05.250000Z",
+                datetime(2030, 1, 2, 3, 4, 5, 250000, tzinfo=UTC),
+            ),
+            (
+                "2030-01-02T03:04:05.250000+00:00",
+                datetime(2030, 1, 2, 3, 4, 5, 250000, tzinfo=UTC),
+            ),
+        ],
+    )
+    async def test_accepts_utc_timestamps(self, raw: str, expected: datetime) -> None:
+        http_client = _servicex_client_for({"expires_at": raw})
+        client = ProxyClient(
+            BROKER_URL, kind="servicex", min_remaining=0, http_client=http_client
+        )
+
+        result = await client.access_token("bearer")
+
+        assert result.expires_at == expected
+
+    @pytest.mark.parametrize(
+        ("raw", "message"),
+        [
+            ("not-a-timestamp", "Invalid isoformat string"),
+            ("", "Invalid isoformat string"),
+            ("2030-13-45T00:00:00Z", "month must be in 1..12"),
+        ],
+    )
+    async def test_invalid_timestamp_raises_value_error(
+        self, raw: str, message: str
+    ) -> None:
+        http_client = _servicex_client_for({"expires_at": raw})
+        client = ProxyClient(
+            BROKER_URL, kind="servicex", min_remaining=0, http_client=http_client
+        )
+
+        with pytest.raises(ValueError, match=message):
+            await client.access_token("bearer")
 
 
 class TestServiceXNotAvailableAndErrors:

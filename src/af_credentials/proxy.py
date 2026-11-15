@@ -91,18 +91,6 @@ class ProxyRedeemError(Exception):
         self.detail = detail
 
 
-def _parse_iso8601(value: str) -> datetime:
-    """Parse an ISO-8601 timestamp, accepting a trailing Z on Python 3.10.
-
-    ``datetime.fromisoformat`` only learned the ``Z`` suffix in 3.11; the
-    broker emits ``+00:00`` offsets today, but a UTC designator from another
-    issuer must not break the oldest supported interpreter.
-    """
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    return datetime.fromisoformat(value)
-
-
 @dataclass
 class ProxyHandle:
     """A materialized x509/VOMS proxy on disk.
@@ -251,7 +239,7 @@ class ProxyClient:
         return ProxyHandle(
             path=path,
             dn=data["dn"],
-            expires_at=_parse_iso8601(data["expires_at"]),
+            expires_at=datetime.fromisoformat(data["expires_at"]),
             nickname=data["nickname"],
             voms_attributes=data["voms_attributes"],
         )
@@ -291,8 +279,8 @@ class ProxyClient:
             path=path,
             principal=data["principal"],
             realm=data["realm"],
-            expires_at=_parse_iso8601(data["expires_at"]),
-            renew_until=_parse_iso8601(renew_until)
+            expires_at=datetime.fromisoformat(data["expires_at"]),
+            renew_until=datetime.fromisoformat(renew_until)
             if renew_until is not None
             else None,
         )
@@ -316,7 +304,7 @@ class ProxyClient:
         data = await self._redeem(bearer)
         return ServiceXAccessToken(
             access_token=data["access_token"],
-            expires_at=_parse_iso8601(data["expires_at"]),
+            expires_at=datetime.fromisoformat(data["expires_at"]),
         )
 
     def _ensure_dir(self) -> Path:
