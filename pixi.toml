@@ -27,9 +27,6 @@ pyjwt = ">=2.8"
 cryptography = ">=42"
 httpx2 = ">=2.5.0,<3"
 
-[feature.py310.dependencies]
-python = "<3.11,>=3.10"
-
 [feature.py311.dependencies]
 python = "<3.12,>=3.11"
 
@@ -92,7 +89,6 @@ build-check = { cmd = "twine check --strict ./dist/*", depends-on = ["build"], d
 [environments]
 docs = ["docs"]
 dev = ["dev"]
-py310 = ["test", "py310"]
 py311 = ["test", "py311"]
 py312 = ["test", "py312"]
 py313 = ["test", "py313"]

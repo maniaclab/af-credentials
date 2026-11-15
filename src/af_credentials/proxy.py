@@ -60,8 +60,7 @@ import httpx2
 
 if TYPE_CHECKING:
     from types import TracebackType
-
-    from typing_extensions import Self
+    from typing import Self
 
 _REDEEM_PATH_TEMPLATE = "/v1/credentials/{kind}/redeem"
 
